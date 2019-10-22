@@ -1,0 +1,12 @@
+[package]
+name = "netmsg"
+version = "0.1.0"
+authors = ["Alexey Zatelepin <alex.zatelepin@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+lazy_static = "1.3.0"
+mio = "0.6"
+byteorder = "1.3"
+slab = "0.4.2"
+crossbeam-channel = "0.3.9"
