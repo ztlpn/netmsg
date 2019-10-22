@@ -1,3 +1,24 @@
+//! An event loop and a simple messaging layer over TCP sockets. This is a toy
+//! project created with educational purposes. It is not intended for general use.
+//!
+//! # Example
+//!
+//! Bind to an address, send and receive a message:
+//!
+//! ```rust
+//! let addr_table = AddressTable([
+//!     (NodeId(0xdeadbeef), "127.0.0.1:2000"),
+//!     (NodeId(0xfeedface), "127.0.0.1:2001"),
+//! ].iter().map(|(id, addr)| (*id, addr.parse().unwrap())).collect());
+//!
+//! let node = NetworkNode::bind(NodeId(0xdeadbeef), addr_table).unwrap();
+//!
+//! node.send(NodeId(0xfeedface), b"hello", None).unwrap();
+//!
+//! let msg = node.recv(None).unwrap();
+//! println!("recv msg: {} from {}", String::from_utf8(msg.payload).unwrap(), msg.peer_id);
+//! ```
+
 use std::{
     io::{self, Write},
     error::Error,
@@ -29,9 +50,21 @@ pub trait Resolver {
     fn resolve(&self, node_id: NodeId) -> Option<std::net::SocketAddr>;
 }
 
-impl Resolver for &HashMap<NodeId, std::net::SocketAddr> {
+pub struct AddressTable(pub HashMap<NodeId, std::net::SocketAddr>);
+
+impl Resolver for AddressTable {
     fn resolve(&self, node_id: NodeId) -> Option<std::net::SocketAddr> {
-        self.get(&node_id).cloned()
+        self.0.get(&node_id).cloned()
+    }
+}
+
+impl<T, D> Resolver for D
+where
+    T: Resolver,
+    D: std::ops::Deref<Target = T>,
+{
+    fn resolve(&self, node_id: NodeId) -> Option<std::net::SocketAddr> {
+        (**self).resolve(node_id)
     }
 }
 
@@ -40,6 +73,7 @@ pub struct Message {
     pub payload: Vec<u8>,
 }
 
+/// The main API entry point. Represents a node that can send and receive messages.
 pub struct NetworkNode {
     thread: Option<std::thread::JoinHandle<()>>,
 
@@ -54,6 +88,7 @@ pub struct NetworkNode {
 impl NetworkNode {
     const OUT_BUF_CAPACITY: usize = 4096; // May overflow if we will need to send a big message.
 
+    /// Create a new node and bind it to an address.
     pub fn bind<R>(my_id: NodeId, resolver: R) -> Result<NetworkNode>
     where
         R: Resolver + Send + 'static,
@@ -114,6 +149,8 @@ impl NetworkNode {
         })
     }
 
+    /// Send a message to a peer. Message delivery is not guaranteed - if the function returns
+    /// Ok(), it means only that the message is copied to a userspace buffer.
     pub fn send(&self, peer_id: NodeId, payload: &[u8], timeout: Option<Duration>) -> Result<()> {
         let deadline = timeout.map(|t| Instant::now() + t);
 
@@ -161,6 +198,7 @@ impl NetworkNode {
         Ok(())
     }
 
+    /// Wait till all pending messages are sent.
     pub fn flush(&self) {
         let peer_id2output = self.peer_id2output.lock().unwrap();
         for (_, peer) in peer_id2output.iter() {
@@ -171,6 +209,7 @@ impl NetworkNode {
         }
     }
 
+    /// Receive a message from some peer with optional timeout.
     pub fn recv(&self, timeout: Option<Duration>) -> Result<Message> {
         let msg = if let Some(timeout) = timeout {
             self.msgs_in_recver.recv_timeout(timeout)?
@@ -1084,14 +1123,14 @@ mod tests {
     };
 
     lazy_static::lazy_static! {
-        static ref NODE_TO_ADDR: HashMap<NodeId, std::net::SocketAddr> = [
+        static ref NODE_TO_ADDR: AddressTable = AddressTable([
             (NodeId(0xdeadbeef), "127.0.0.1:2000"),
             (NodeId(0xcafebabe), "127.0.0.1:2001"),
             (NodeId(0xfeedface), "127.0.0.1:2002"),
-        ].iter().map(|(id, addr)| (id.clone(), addr.parse().unwrap())).collect();
-    }
+        ].iter().map(|(id, addr)| (*id, addr.parse().unwrap())).collect());
 
-    lazy_static::lazy_static! { static ref SERIALIZE_MUTEX: Mutex<()> = Mutex::new(()); }
+        static ref SERIALIZE_MUTEX: Mutex<()> = Mutex::new(());
+    }
 
     const ID1: NodeId = NodeId(0xdeadbeef);
     const ID2: NodeId = NodeId(0xfeedface);
@@ -1099,7 +1138,7 @@ mod tests {
     #[test]
     fn destroy() {
         let _serialize_guard = SERIALIZE_MUTEX.lock().unwrap();
-        let mut node = Some(NetworkNode::bind(ID1, &*NODE_TO_ADDR));
+        let mut node = Some(NetworkNode::bind(ID1, &NODE_TO_ADDR).unwrap());
         node.take();
     }
 
@@ -1112,7 +1151,7 @@ mod tests {
             let barrier = barrier.clone();
             move || {
                 let (my_id, other_id) = (ID1, ID2);
-                let node = NetworkNode::bind(my_id, &*NODE_TO_ADDR).unwrap();
+                let node = NetworkNode::bind(my_id, &NODE_TO_ADDR).unwrap();
 
                 barrier.wait();
 
@@ -1129,7 +1168,7 @@ mod tests {
             let barrier = barrier.clone();
             move || {
                 let (my_id, other_id) = (ID2, ID1);
-                let node = NetworkNode::bind(my_id, &*NODE_TO_ADDR).unwrap();
+                let node = NetworkNode::bind(my_id, &NODE_TO_ADDR).unwrap();
 
                 barrier.wait();
 
@@ -1149,12 +1188,12 @@ mod tests {
     #[test]
     fn connect_after_send() {
         let _serialize_guard = SERIALIZE_MUTEX.lock().unwrap();
-        let node1 = NetworkNode::bind(ID1, &*NODE_TO_ADDR).unwrap();
+        let node1 = NetworkNode::bind(ID1, &NODE_TO_ADDR).unwrap();
 
         node1.send(ID2, b"hello", None).unwrap();
         std::thread::sleep(Duration::from_millis(1000));
 
-        let node2 = NetworkNode::bind(ID2, &*NODE_TO_ADDR).unwrap();
+        let node2 = NetworkNode::bind(ID2, &NODE_TO_ADDR).unwrap();
         let msg = node2.recv(None).unwrap();
         assert_eq!(msg.peer_id, ID1);
         assert_eq!(msg.payload, b"hello");
