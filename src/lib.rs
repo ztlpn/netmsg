@@ -25,6 +25,157 @@ impl std::fmt::Display for NodeId {
     }
 }
 
+pub struct Message {
+    pub peer_id: NodeId,
+    pub payload: Vec<u8>,
+}
+
+pub struct NetworkNode {
+    thread: Option<std::thread::JoinHandle<()>>,
+
+    msgs_in_recver: Receiver<Message>,
+
+    peer_id2output: Mutex<HashMap<NodeId, Arc<PeerOutput>>>,
+    output_reqs_sender: Option<Sender<Arc<PeerOutput>>>,
+
+    notify_readiness: Mutex<mio::SetReadiness>,
+}
+
+impl NetworkNode {
+    const OUT_BUF_CAPACITY: usize = 4096; // May overflow if we will need to send a big message.
+
+    pub fn bind(my_id: NodeId) -> Result<NetworkNode> {
+        let my_addr = NODE_TO_ADDR.get(&my_id).ok_or(format!("couldn't find my id: {}", my_id))?;
+        eprintln!("node {}: will bind to addr: {}", my_id, my_addr);
+
+        let listener = mio::net::TcpListener::bind(my_addr)?;
+        let poll = mio::Poll::new()?;
+
+        poll.register(
+            &listener,
+            ThreadPriv::LISTENER_TOKEN,
+            mio::Ready::readable(),
+            mio::PollOpt::edge(),
+        )?;
+
+        let (_notify_registration, notify_readiness) = mio::Registration::new2();
+        poll.register(
+            &_notify_registration,
+            ThreadPriv::NOTIFY_TOKEN,
+            mio::Ready::readable(),
+            mio::PollOpt::edge(),
+        )?;
+
+        let (msgs_in_sender, msgs_in_recver) = channel::unbounded();
+        let (output_reqs_sender, output_reqs_recver) = channel::unbounded();
+
+        let thread = std::thread::spawn(move || {
+            let mut thread_priv = ThreadPriv {
+                my_id,
+
+                poll,
+                listener,
+                channels: slab::Slab::with_capacity(1024),
+
+                ready_tokens: VecDeque::with_capacity(1024),
+                timers: BinaryHeap::new(),
+
+                msgs_in_sender,
+                output_reqs_recver,
+
+                _notify_registration,
+            };
+            let mut peer_id2channel = HashMap::new();
+            thread_priv.work(&mut peer_id2channel).unwrap();
+        });
+
+        Ok(NetworkNode {
+            thread: Some(thread),
+
+            msgs_in_recver,
+
+            peer_id2output: Default::default(),
+            output_reqs_sender: Some(output_reqs_sender),
+            notify_readiness: Mutex::new(notify_readiness),
+        })
+    }
+
+    pub fn send(&self, peer_id: NodeId, payload: &[u8], timeout: Option<Duration>) -> Result<()> {
+        let deadline = timeout.map(|t| Instant::now() + t);
+
+        let peer = {
+            let mut peer_id2output = self.peer_id2output.lock().unwrap();
+            peer_id2output
+                .entry(peer_id)
+                .or_insert_with(|| {
+                    Arc::new(PeerOutput {
+                        id: peer_id,
+                        out_buf: Mutex::new(OutputBuf::with_capacity(Self::OUT_BUF_CAPACITY)),
+                        out_cond: Condvar::new(),
+                    })
+                })
+                .clone()
+        };
+
+        {
+            let mut out_buf = peer.out_buf.lock().unwrap();
+            loop {
+                match out_buf.push_msg(&payload) {
+                    Ok(()) => break,
+                    Err(e) if e.kind() != io::ErrorKind::WouldBlock => return Err(e.into()),
+                    _ => {}
+                }
+
+                out_buf = if let Some(deadline) = deadline {
+                    let now = Instant::now();
+                    let cur_timeout = if now < deadline {
+                        deadline - now
+                    } else {
+                        return Err(
+                            io::Error::new(io::ErrorKind::TimedOut, "send timed out").into()
+                        );
+                    };
+                    peer.out_cond.wait_timeout(out_buf, cur_timeout).unwrap().0
+                } else {
+                    peer.out_cond.wait(out_buf).unwrap()
+                }
+            }
+        }
+
+        self.output_reqs_sender.as_ref().unwrap().send(peer).unwrap();
+        self.notify_readiness.lock().unwrap().set_readiness(mio::Ready::readable()).unwrap();
+        Ok(())
+    }
+
+    pub fn flush(&self) {
+        let peer_id2output = self.peer_id2output.lock().unwrap();
+        for (_, peer) in peer_id2output.iter() {
+            let mut out_buf = peer.out_buf.lock().unwrap();
+            while !out_buf.is_done() {
+                out_buf = peer.out_cond.wait(out_buf).unwrap();
+            }
+        }
+    }
+
+    pub fn recv(&self, timeout: Option<Duration>) -> Result<Message> {
+        let msg = if let Some(timeout) = timeout {
+            self.msgs_in_recver.recv_timeout(timeout)?
+        } else {
+            self.msgs_in_recver.recv()?
+        };
+
+        Ok(msg)
+    }
+}
+
+impl Drop for NetworkNode {
+    fn drop(&mut self) {
+        self.output_reqs_sender.take();
+        self.notify_readiness.get_mut().unwrap().set_readiness(mio::Ready::readable()).unwrap();
+        self.thread.take().unwrap().join().unwrap();
+    }
+}
+
 lazy_static::lazy_static! {
     static ref NODE_TO_ADDR: HashMap<NodeId, std::net::SocketAddr> = [
         (NodeId(0xdeadbeef), "127.0.0.1:2000"),
@@ -210,15 +361,15 @@ struct OutputBuf {
 }
 
 impl OutputBuf {
-    pub fn with_capacity(cap: usize) -> Self {
+    fn with_capacity(cap: usize) -> Self {
         Self { buf: Vec::with_capacity(cap), written: 0, sizes: VecDeque::new(), msg_start: 0 }
     }
 
-    pub fn is_done(&self) -> bool {
+    fn is_done(&self) -> bool {
         self.written == self.buf.len()
     }
 
-    pub fn sync_after_error(&mut self) {
+    fn sync_after_error(&mut self) {
         self.written = self.msg_start;
     }
 
@@ -248,7 +399,7 @@ impl OutputBuf {
         Ok(&mut self.buf[prev_len..])
     }
 
-    pub fn push_msg(&mut self, data: &[u8]) -> io::Result<()> {
+    fn push_msg(&mut self, data: &[u8]) -> io::Result<()> {
         let header: u32 = MessageHeader::Data { len: data.len() }.serialize()?;
         let slice = self.prepare_slice(4 + data.len())?;
         byteorder::NetworkEndian::write_u32(slice, header);
@@ -256,7 +407,7 @@ impl OutputBuf {
         Ok(())
     }
 
-    pub fn flush_until_blocked(&mut self, sock: &mio::tcp::TcpStream) -> io::Result<()> {
+    fn flush_until_blocked(&mut self, sock: &mio::tcp::TcpStream) -> io::Result<()> {
         while self.written != self.buf.len() {
             match (&*sock).write(&self.buf[self.written..]) {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
@@ -370,7 +521,7 @@ enum Poll {
 impl Channel {
     const MAX_MSGS_IN: usize = 4096;
 
-    pub fn connecting(my_id: NodeId, peer_id: NodeId, sock: SockPtr, slab_key: usize) -> Self {
+    fn connecting(my_id: NodeId, peer_id: NodeId, sock: SockPtr, slab_key: usize) -> Self {
         let mut ret = Self::new(
             ChannelState::ConnectingSendingGreeting { n_attempts: 0 },
             my_id,
@@ -382,7 +533,7 @@ impl Channel {
         ret
     }
 
-    pub fn accepting(my_id: NodeId, sock: SockPtr, slab_key: usize) -> Self {
+    fn accepting(my_id: NodeId, sock: SockPtr, slab_key: usize) -> Self {
         Self::new(ChannelState::AcceptedWaitingGreeting, my_id, NodeId::UNKNOWN, sock, slab_key)
     }
 
@@ -604,34 +755,10 @@ impl Channel {
 
 type ChannelPtr = Arc<RefCell<Channel>>;
 
-pub struct Message {
-    pub peer_id: NodeId,
-    pub payload: Vec<u8>,
-}
-
-pub struct NetworkNode {
-    thread: Option<std::thread::JoinHandle<()>>,
-
-    msgs_in_recver: Receiver<Message>,
-
-    peer_id2output: Mutex<HashMap<NodeId, Arc<PeerOutput>>>,
-    output_reqs_sender: Option<Sender<Arc<PeerOutput>>>,
-
-    notify_readiness: Mutex<mio::SetReadiness>,
-}
-
 struct PeerOutput {
     id: NodeId,
     out_buf: Mutex<OutputBuf>,
     out_cond: Condvar,
-}
-
-impl Drop for NetworkNode {
-    fn drop(&mut self) {
-        self.output_reqs_sender.take();
-        self.notify_readiness.get_mut().unwrap().set_readiness(mio::Ready::readable()).unwrap();
-        self.thread.take().unwrap().join().unwrap();
-    }
 }
 
 struct ThreadPriv {
@@ -932,133 +1059,6 @@ impl ThreadPriv {
                 entry.remove();
             }
         }
-    }
-}
-
-impl NetworkNode {
-    const OUT_BUF_CAPACITY: usize = 4096; // May overflow if we will need to send a big message.
-
-    pub fn bind(my_id: NodeId) -> Result<NetworkNode> {
-        let my_addr = NODE_TO_ADDR.get(&my_id).ok_or(format!("couldn't find my id: {}", my_id))?;
-        eprintln!("node {}: will bind to addr: {}", my_id, my_addr);
-
-        let listener = mio::net::TcpListener::bind(my_addr)?;
-        let poll = mio::Poll::new()?;
-
-        poll.register(
-            &listener,
-            ThreadPriv::LISTENER_TOKEN,
-            mio::Ready::readable(),
-            mio::PollOpt::edge(),
-        )?;
-
-        let (_notify_registration, notify_readiness) = mio::Registration::new2();
-        poll.register(
-            &_notify_registration,
-            ThreadPriv::NOTIFY_TOKEN,
-            mio::Ready::readable(),
-            mio::PollOpt::edge(),
-        )?;
-
-        let (msgs_in_sender, msgs_in_recver) = channel::unbounded();
-        let (output_reqs_sender, output_reqs_recver) = channel::unbounded();
-
-        let thread = std::thread::spawn(move || {
-            let mut thread_priv = ThreadPriv {
-                my_id,
-
-                poll,
-                listener,
-                channels: slab::Slab::with_capacity(1024),
-
-                ready_tokens: VecDeque::with_capacity(1024),
-                timers: BinaryHeap::new(),
-
-                msgs_in_sender,
-                output_reqs_recver,
-
-                _notify_registration,
-            };
-            let mut peer_id2channel = HashMap::new();
-            thread_priv.work(&mut peer_id2channel).unwrap();
-        });
-
-        Ok(NetworkNode {
-            thread: Some(thread),
-
-            msgs_in_recver,
-
-            peer_id2output: Default::default(),
-            output_reqs_sender: Some(output_reqs_sender),
-            notify_readiness: Mutex::new(notify_readiness),
-        })
-    }
-
-    pub fn send(&self, peer_id: NodeId, payload: &[u8], timeout: Option<Duration>) -> Result<()> {
-        let deadline = timeout.map(|t| Instant::now() + t);
-
-        let peer = {
-            let mut peer_id2output = self.peer_id2output.lock().unwrap();
-            peer_id2output
-                .entry(peer_id)
-                .or_insert_with(|| {
-                    Arc::new(PeerOutput {
-                        id: peer_id,
-                        out_buf: Mutex::new(OutputBuf::with_capacity(Self::OUT_BUF_CAPACITY)),
-                        out_cond: Condvar::new(),
-                    })
-                })
-                .clone()
-        };
-
-        {
-            let mut out_buf = peer.out_buf.lock().unwrap();
-            loop {
-                match out_buf.push_msg(&payload) {
-                    Ok(()) => break,
-                    Err(e) if e.kind() != io::ErrorKind::WouldBlock => return Err(e.into()),
-                    _ => {}
-                }
-
-                out_buf = if let Some(deadline) = deadline {
-                    let now = Instant::now();
-                    let cur_timeout = if now < deadline {
-                        deadline - now
-                    } else {
-                        return Err(
-                            io::Error::new(io::ErrorKind::TimedOut, "send timed out").into()
-                        );
-                    };
-                    peer.out_cond.wait_timeout(out_buf, cur_timeout).unwrap().0
-                } else {
-                    peer.out_cond.wait(out_buf).unwrap()
-                }
-            }
-        }
-
-        self.output_reqs_sender.as_ref().unwrap().send(peer).unwrap();
-        self.notify_readiness.lock().unwrap().set_readiness(mio::Ready::readable()).unwrap();
-        Ok(())
-    }
-
-    pub fn flush(&self) {
-        let peer_id2output = self.peer_id2output.lock().unwrap();
-        for (_, peer) in peer_id2output.iter() {
-            let mut out_buf = peer.out_buf.lock().unwrap();
-            while !out_buf.is_done() {
-                out_buf = peer.out_cond.wait(out_buf).unwrap();
-            }
-        }
-    }
-
-    pub fn recv(&self, timeout: Option<Duration>) -> Result<Message> {
-        let msg = if let Some(timeout) = timeout {
-            self.msgs_in_recver.recv_timeout(timeout)?
-        } else {
-            self.msgs_in_recver.recv()?
-        };
-
-        Ok(msg)
     }
 }
 
