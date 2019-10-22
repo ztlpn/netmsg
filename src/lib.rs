@@ -25,6 +25,16 @@ impl std::fmt::Display for NodeId {
     }
 }
 
+pub trait Resolver {
+    fn resolve(&self, node_id: NodeId) -> Option<std::net::SocketAddr>;
+}
+
+impl Resolver for &HashMap<NodeId, std::net::SocketAddr> {
+    fn resolve(&self, node_id: NodeId) -> Option<std::net::SocketAddr> {
+        self.get(&node_id).cloned()
+    }
+}
+
 pub struct Message {
     pub peer_id: NodeId,
     pub payload: Vec<u8>,
@@ -44,11 +54,14 @@ pub struct NetworkNode {
 impl NetworkNode {
     const OUT_BUF_CAPACITY: usize = 4096; // May overflow if we will need to send a big message.
 
-    pub fn bind(my_id: NodeId) -> Result<NetworkNode> {
-        let my_addr = NODE_TO_ADDR.get(&my_id).ok_or(format!("couldn't find my id: {}", my_id))?;
+    pub fn bind<R>(my_id: NodeId, resolver: R) -> Result<NetworkNode>
+    where
+        R: Resolver + Send + 'static,
+    {
+        let my_addr = resolver.resolve(my_id).ok_or(format!("couldn't find my id: {}", my_id))?;
         eprintln!("node {}: will bind to addr: {}", my_id, my_addr);
 
-        let listener = mio::net::TcpListener::bind(my_addr)?;
+        let listener = mio::net::TcpListener::bind(&my_addr)?;
         let poll = mio::Poll::new()?;
 
         poll.register(
@@ -72,6 +85,7 @@ impl NetworkNode {
         let thread = std::thread::spawn(move || {
             let mut thread_priv = ThreadPriv {
                 my_id,
+                resolver: Box::new(resolver),
 
                 poll,
                 listener,
@@ -174,14 +188,6 @@ impl Drop for NetworkNode {
         self.notify_readiness.get_mut().unwrap().set_readiness(mio::Ready::readable()).unwrap();
         self.thread.take().unwrap().join().unwrap();
     }
-}
-
-lazy_static::lazy_static! {
-    static ref NODE_TO_ADDR: HashMap<NodeId, std::net::SocketAddr> = [
-        (NodeId(0xdeadbeef), "127.0.0.1:2000"),
-        (NodeId(0xcafebabe), "127.0.0.1:2001"),
-        (NodeId(0xfeedface), "127.0.0.1:2002"),
-    ].iter().map(|(id, addr)| (id.clone(), addr.parse().unwrap())).collect();
 }
 
 #[derive(Debug)]
@@ -763,6 +769,7 @@ struct PeerOutput {
 
 struct ThreadPriv {
     my_id: NodeId,
+    resolver: Box<dyn Resolver>,
 
     poll: mio::Poll,
     listener: mio::net::TcpListener,
@@ -1001,17 +1008,18 @@ impl ThreadPriv {
 
     fn open_socket(
         my_id: NodeId,
+        resolver: &dyn Resolver,
         peer_id: NodeId,
         slab_key: usize,
         poll: &mio::Poll,
     ) -> io::Result<SockPtr> {
-        let peer_addr = NODE_TO_ADDR.get(&peer_id).ok_or_else(|| {
+        let peer_addr = resolver.resolve(peer_id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("couldn't find peer id: {}", peer_id))
         })?;
 
         eprintln!("node {}: connecting to peer {} addr: {}", my_id, peer_id, peer_addr);
 
-        let sock_ptr = Arc::new(RefCell::new(mio::net::TcpStream::connect(peer_addr)?));
+        let sock_ptr = Arc::new(RefCell::new(mio::net::TcpStream::connect(&peer_addr)?));
         poll.register(
             &*sock_ptr.borrow(),
             Self::slab_key_to_token(slab_key),
@@ -1025,7 +1033,8 @@ impl ThreadPriv {
     fn open_channel(&mut self, peer_id: NodeId) -> io::Result<ChannelPtr> {
         let entry = self.channels.vacant_entry();
         let slab_key = entry.key();
-        let sock_ptr = Self::open_socket(self.my_id, peer_id, slab_key, &self.poll)?;
+        let sock_ptr =
+            Self::open_socket(self.my_id, self.resolver.as_ref(), peer_id, slab_key, &self.poll)?;
         let channel_ptr =
             Arc::new(RefCell::new(Channel::connecting(self.my_id, peer_id, sock_ptr, slab_key)));
         entry.insert(channel_ptr.clone());
@@ -1038,8 +1047,13 @@ impl ThreadPriv {
         output: Arc<PeerOutput>,
     ) -> io::Result<()> {
         assert!(!channel.is_scheduled);
-        let sock_ptr =
-            Self::open_socket(self.my_id, channel.peer_id, channel.slab_key, &self.poll)?;
+        let sock_ptr = Self::open_socket(
+            self.my_id,
+            self.resolver.as_ref(),
+            channel.peer_id,
+            channel.slab_key,
+            &self.poll,
+        )?;
         channel.reconnect(sock_ptr);
         channel.output = Some(output);
         self.schedule_channel(channel);
@@ -1069,6 +1083,14 @@ mod tests {
         std::sync::{Arc, Barrier},
     };
 
+    lazy_static::lazy_static! {
+        static ref NODE_TO_ADDR: HashMap<NodeId, std::net::SocketAddr> = [
+            (NodeId(0xdeadbeef), "127.0.0.1:2000"),
+            (NodeId(0xcafebabe), "127.0.0.1:2001"),
+            (NodeId(0xfeedface), "127.0.0.1:2002"),
+        ].iter().map(|(id, addr)| (id.clone(), addr.parse().unwrap())).collect();
+    }
+
     lazy_static::lazy_static! { static ref SERIALIZE_MUTEX: Mutex<()> = Mutex::new(()); }
 
     const ID1: NodeId = NodeId(0xdeadbeef);
@@ -1077,7 +1099,7 @@ mod tests {
     #[test]
     fn destroy() {
         let _serialize_guard = SERIALIZE_MUTEX.lock().unwrap();
-        let mut node = Some(NetworkNode::bind(ID1));
+        let mut node = Some(NetworkNode::bind(ID1, &*NODE_TO_ADDR));
         node.take();
     }
 
@@ -1090,7 +1112,7 @@ mod tests {
             let barrier = barrier.clone();
             move || {
                 let (my_id, other_id) = (ID1, ID2);
-                let node = NetworkNode::bind(my_id).unwrap();
+                let node = NetworkNode::bind(my_id, &*NODE_TO_ADDR).unwrap();
 
                 barrier.wait();
 
@@ -1107,7 +1129,7 @@ mod tests {
             let barrier = barrier.clone();
             move || {
                 let (my_id, other_id) = (ID2, ID1);
-                let node = NetworkNode::bind(my_id).unwrap();
+                let node = NetworkNode::bind(my_id, &*NODE_TO_ADDR).unwrap();
 
                 barrier.wait();
 
@@ -1127,12 +1149,12 @@ mod tests {
     #[test]
     fn connect_after_send() {
         let _serialize_guard = SERIALIZE_MUTEX.lock().unwrap();
-        let node1 = NetworkNode::bind(ID1).unwrap();
+        let node1 = NetworkNode::bind(ID1, &*NODE_TO_ADDR).unwrap();
 
         node1.send(ID2, b"hello", None).unwrap();
         std::thread::sleep(Duration::from_millis(1000));
 
-        let node2 = NetworkNode::bind(ID2).unwrap();
+        let node2 = NetworkNode::bind(ID2, &*NODE_TO_ADDR).unwrap();
         let msg = node2.recv(None).unwrap();
         assert_eq!(msg.peer_id, ID1);
         assert_eq!(msg.payload, b"hello");
